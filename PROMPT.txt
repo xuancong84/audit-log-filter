@@ -1,0 +1,35 @@
+Please write a python program that does audit log filtering by the given date range. Keep the code as short as possible. Support multi-core processing.
+The input can be a .tar.gz archive or a folder; same for the output.
+Recursively iterate through each item in the input:
+- if an item is an archive, unpack every items inside, process, and pack back, recursively.
+- if an item is a text file, process every line
+- if an item is a compressed text file, decompress, process every line, and compress back
+- otherwise, leave it as it is
+
+Support the following line formats containing datetime:
+1. dpkg log
+2026-05-12 18:47:39 startup packages remove
+
+2. auditd log
+type=CWD msg=audit(1779039207.533:33367473): cwd="/home/zhao/Desktop/diseaseProject"
+
+3. boot log
+------------ Tue May 12 18:45:08 +08 2026 ------------
+
+4. apt history log
+Start-Date: 2026-05-12  18:50:47
+End-Date: 2026-05-12  18:50:51
+
+5. apt term log
+Log started: 2026-05-12  18:47:39
+...
+
+6. auth log (missing year number means this year):
+Jan  1 08:00:45 ...
+2026-05-18T16:12:12.044297+08:00 ...
+
+
+General guidelines:
+- Make your code generic and compatible with as many formats as possible. If it crashes on a line, ignore the line, leave it as it is.
+- If the entire file content all lies outside the date range, output the empty file.
+- Print progress using '\r' to avoid massive scroll, output warnings/errors if any.
