@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Filter audit logs by datetime range with multi-core processing.
 
-Tar archives are streamed: each member is extracted, processed immediately,
-and discarded before reading the next.  Only one member's data lives on disk
-at any given moment.
+Tar archives are streamed: each member is extracted, processed, and
+discarded before reading the next.  Only one member's data lives on
+disk at any given moment.
 
-Multi-core processing via multiprocessing.Pool is used for overall file
-processing, bounded by --workers (default: os.cpu_count()).
+The ``-j / --workers`` flag limits the multiprocessing Pool to at most
+``--workers`` concurrent file-processing jobs (default = CPU count).
 """
 
 import argparse
@@ -21,6 +21,7 @@ from datetime import datetime
 from multiprocessing import Pool
 from pathlib import Path
 
+# ── datetime patterns ──────────────────────────────────────────────
 PATTERNS = [
     re.compile(r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+'),
     re.compile(r'msg=audit\((\d+\.?\d*):'),
@@ -43,26 +44,21 @@ def parse_ts(line):
             if idx == 1:
                 return datetime.fromtimestamp(float(m.group(1).strip()))
             if idx == 2:
-                ts = m.group(1).strip()
-                tz = m.group(2).strip()
+                ts, tz = m.group(1).strip(), m.group(2).strip()
                 if len(tz) == 3 or (len(tz) == 4 and tz[0] in '+-'):
-                    tz = tz[:3] + tz[3:].ljust(2, '0') if len(tz) == 3 else tz
-                full = f"{ts} {tz}"
-                dt = datetime.strptime(full, "%a %b %d %H:%M:%S %z %Y")
-                return dt.replace(tzinfo=None) if dt.tzinfo else dt
+                    tz = tz[:3] + tz[3:].ljust(2, '0')
+                return datetime.strptime(f"{ts} {tz}",
+                    "%a %b %d %H:%M:%S %z %Y").replace(tzinfo=None)
             if idx == 5:
-                current_year = datetime.now().year
-                return datetime.strptime(m.group(1).strip(), "%b %d %H:%M:%S").replace(year=current_year)
+                return datetime.strptime(m.group(1).strip(),
+                    "%b %d %H:%M:%S").replace(year=datetime.now().year)
             if idx == 6:
-                ts_part = m.group(1).strip()
-                tz_part = m.group(2).strip()
-                fmt = "%Y-%m-%dT%H:%M:%S.%f%z" if "." in ts_part else "%Y-%m-%dT%H:%M:%S%z"
-                dt = datetime.strptime(ts_part + tz_part, fmt)
-                return dt.replace(tzinfo=None) if dt.tzinfo else dt
-            ts = m.group(1).strip()
+                tp, tz = m.group(1).strip(), m.group(2).strip()
+                f = "%Y-%m-%dT%H:%M:%S.%f%z" if "." in tp else "%Y-%m-%dT%H:%M:%S%z"
+                return datetime.strptime(tp + tz, f).replace(tzinfo=None)
             for fmt in (DATE_FMTS[0], DATE_FMTS[2]):
                 try:
-                    return datetime.strptime(ts, fmt)
+                    return datetime.strptime(m.group(1).strip(), fmt)
                 except ValueError:
                     continue
         except (ValueError, OSError):
@@ -71,21 +67,20 @@ def parse_ts(line):
 
 
 def filter_text(text, start, end):
-    lines = text.splitlines(keepends=True) if text else []
-    result = []
-    for line in lines:
+    kept = []
+    for line in text.splitlines(keepends=True):
         try:
             ts = parse_ts(line)
             if ts and start <= ts <= end:
-                result.append(line)
+                kept.append(line)
         except Exception:
             pass
-    return "".join(result)
+    return "".join(kept)
 
 
 def process_text(path, start, end):
     os.chmod(path, 0o644)
-    with open(path, "r", errors="replace") as f:
+    with open(path) as f:
         content = f.read()
     with open(path, "w") as f:
         f.write(filter_text(content, start, end))
@@ -93,7 +88,7 @@ def process_text(path, start, end):
 
 def process_gz(path, start, end):
     os.chmod(path, 0o644)
-    with gzip.open(path, "rt", errors="replace") as f:
+    with gzip.open(path, "rt") as f:
         content = f.read()
     with gzip.open(path, "wt") as f:
         f.write(filter_text(content, start, end))
@@ -101,8 +96,8 @@ def process_gz(path, start, end):
 
 def is_tar(path):
     s = path.lower()
-    return (s.endswith(".tar.gz") or s.endswith(".tgz") or
-            s.endswith(".tar.bz2") or s.endswith(".tbz2") or s.endswith(".tar"))
+    return any(s.endswith(e) for e in
+               (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar"))
 
 
 def tar_comp(path):
@@ -114,134 +109,155 @@ def tar_comp(path):
     return ""
 
 
-def handle_process_file(item_path, start, end):
-    name = item_path.name.lower()
-    try:
-        if name.endswith(".gz"):
-            process_gz(str(item_path), start, end)
+# ── helpers ────────────────────────────────────────────────────────
+def copy_merge(src, dst):
+    """Recursively merge contents of *src* into *dst*."""
+    if not os.path.isdir(src):
+        return
+    for item in os.listdir(src):
+        sp = os.path.join(src, item)
+        dp = os.path.join(dst, item)
+        if os.path.isdir(sp):
+            os.makedirs(dp, exist_ok=True)
+            copy_merge(sp, dp)
         else:
-            process_text(str(item_path), start, end)
-    except Exception as e:
-        sys.stderr.write(f"WARNING {name}: {e}\n")
+            os.makedirs(os.path.dirname(dp), exist_ok=True)
+            shutil.copy2(sp, dp)
 
 
-def handle_tar(tar_path, start, end, workers=1):
-    """Process ONE tar archive.
-
-    Streaming approach: each member is extracted to its own unique temp dir,
-    processed, and the temp dir is discarded before moving to the next member.
-    Only one member lives in memory/disk at a time.
-
-    Nested tar archives are handle_tar()'d recursively (also streaming).
-    """
-    comp = tar_comp(tar_path)
-    mode_map = {"gz": "r:gz", "bz2": "r:bz2", "": "r:"}
-    write_map = {"gz": "w:gz", "bz2": "w:bz2", "": "w:"}
-    tmpdir = tempfile.mkdtemp()
-    root = os.path.basename(os.path.splitext(tar_path)[0])
-    errors = []
-
-    try:
-        with tarfile.open(tar_path, mode_map[comp]) as tar:
-            for member in tar:
-                if member.isdir():
-                    continue
-
-                try:
-                    if is_tar(member.name):
-                        # Nested tar: extract to temp, recurse in-place, clean up
-                        nested_tmp = tempfile.mkdtemp(dir=tmpdir)
-                        tar.extract(member, path=nested_tmp)
-                        entries = os.listdir(nested_tmp)
-                        if entries:
-                            nested_path = os.path.join(
-                                nested_tmp,
-                                _find_nested_file(entries, member.name)
-                            )
-                            handle_tar(nested_path, start, end, workers)
-                        else:
-                            sys.stderr.write(f"WARNING {member.name}: empty nested tar\n")
-                        shutil.rmtree(nested_tmp, ignore_errors=True)
-                        continue
-
-                    # Single-file member: unique temp dir -> process -> discard
-                    member_dir = tempfile.mkdtemp(dir=tmpdir)
-                    tar.extract(member, path=member_dir)
-                    fpath = _resolve_file([(member_dir, f) for f in os.listdir(member_dir)])
-                    if fpath and os.path.isfile(fpath):
-                        handle_process_file(Path(fpath), start, end)
-                    shutil.rmtree(member_dir, ignore_errors=True)
-
-                except Exception as e:
-                    errors.append(f"WARNING {member.name}: {e}\n")
-
-        # Repack all processed contents
-        out = tar_path + ".tmp"
-        with tarfile.open(out, write_map[comp]) as tar:
-            tar.add(tmpdir, arcname=root)
-        shutil.move(out, tar_path)
-
-        for e in errors:
-            sys.stderr.write(e)
-
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _find_nested_file(entries, member_name):
-    base = os.path.basename(member_name)
-    for e in entries:
-        if e.lower() == base.lower():
-            return e
-    return entries[0]
-
-
-def _resolve_file(entries):
-    if len(entries) == 1:
-        return os.path.join(entries[0][0], entries[0][1])
+def find_extracted_file(member, tmpdir):
+    """Find the file tar.extract(member, path=tmpdir) put on disk."""
+    for root, _, files in os.walk(tmpdir):
+        if files:
+            return os.path.join(root, files[0])
     return None
 
 
-def _process_one(path, start, end):
+def save_member_to_path(member_path, extracted_file, workdir):
+    """Extracted file -> workdir, preserving the archive's path."""
+    parts = member_path.strip("/").split("/")
+    dst = workdir
+    for part in parts:
+        if part:
+            dst = os.path.join(dst, part)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(extracted_file, dst)
+
+
+def repack_tar(src_dir, out_path, comp, arcroot=""):
+    """Pack all files in src_dir into a tar archive at out_path."""
+    if comp not in ("gz", "bz2"):
+        comp = ""
+    wm = "w:" + comp
+    with tarfile.open(out_path, wm) as tar:
+        for root, _, files in os.walk(src_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                rel = os.path.relpath(fp, src_dir)
+                an = os.path.join(arcroot, rel) if arcroot else rel
+                tar.add(fp, arcname=an)
+
+
+# ── streaming tar: extract & process members one-by-one ───────────
+def stream_extract_process(tar_obj, workdir, start, end):
+    """Stream-extract each member, process it, save to workdir.
+
+    Only one member lives on disk at a time. Nested tars are delegated
+    to handle_tar_file which repacks them in-place.
+    """
+    for member in tar_obj:
+        if member.isdir():
+            dir_path = os.path.join(workdir, member.name.lstrip("/"))
+            os.makedirs(dir_path, exist_ok=True)
+            continue
+
+        tmp = tempfile.mkdtemp()
+        try:
+            tar_obj.extract(member, path=tmp)
+            extracted = find_extracted_file(member, tmp)
+
+            if extracted and os.path.isfile(extracted) and is_tar(member.name):
+                # Nested tar: process & repack in-place, then copy to workdir
+                try:
+                    handle_tar_file(extracted, start, end)
+                    dst = os.path.join(workdir, member.name)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(extracted, dst)
+                except Exception as e:
+                    sys.stderr.write(f"WARNING {member.name}: {e}\n")
+            elif extracted and os.path.isfile(extracted):
+                # ── Regular file: dispatch by extension ──
+                basename = member.name.lower()
+                try:
+                    if basename.endswith(".gz"):
+                        process_gz(extracted, start, end)
+                    else:
+                        process_text(extracted, start, end)
+                    save_member_to_path(member.name, extracted, workdir)
+                except Exception as e:
+                    # Binary/unrecognizable file: skip silently, keep original
+                    pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── process one file ─────────────────────────────────────────────
+def process_one_file(path, start, end):
     if is_tar(path):
-        handle_tar(path, start, end)
+        handle_tar_file(path, start, end)
     elif path.lower().endswith(".gz"):
         process_gz(path, start, end)
     else:
         process_text(path, start, end)
 
 
-def worker_batch(items):
+def handle_tar_file(tar_path, start, end):
+    """Handle ONE tar: stream-extract, accumulate results, re-pack.
+
+    The tar is modified in-place (re-packed) after all members are
+    processed.  Arcnames inside the tar match the original archive
+    (no extra arcroot prefix).
+    """
+    comp = tar_comp(tar_path)
+    # Use parentheses to make the ternary unambiguous
+    rm = ("r:" + comp) if comp else "r:"
+    workdir = tempfile.mkdtemp()
+    try:
+        with tarfile.open(tar_path, rm) as tar:
+            stream_extract_process(tar, workdir, start, end)
+        out = tar_path + ".tmp"
+        # No arcroot so archive members sit at the archive root
+        repack_tar(workdir, out, comp, arcroot="")
+        shutil.move(out, tar_path)
+    except Exception as e:
+        sys.stderr.write(f"ERROR {tar_path}: {e}\n")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ── Pool worker ──────────────────────────────────────────────────
+def _process_batch(args):
+    """Pool worker: receives (items, start, end) as one tuple."""
+    items, start, end = args
     c = 0
-    for path, start, end in items:
+    for (path,) in items:
         try:
-            _process_one(path, start, end)
+            process_one_file(path, start, end)
             c += 1
         except Exception as e:
             sys.stderr.write(f"WARNING {path}: {e}\n")
     return c
 
 
-def repack_dir(source_dir, tar_path, comp="gz"):
-    mode_map = {"gz": "w:gz", "bz2": "w:bz2", "": "w:"}
-    with tarfile.open(tar_path, mode_map[comp]) as tar:
-        for root, _, files in os.walk(source_dir):
-            for f in files:
-                fp = os.path.join(root, f)
-                arcname = os.path.relpath(fp, source_dir)
-                tar.add(fp, arcname=arcname)
-
-
-def _collect_writable(base):
-    files = []
-    for root, _, fs in os.walk(base):
+def collect_files(base):
+    result = []
+    for r, _, fs in os.walk(base):
         for f in fs:
-            fp = os.path.join(root, f)
-            os.chmod(fp, 0o644)
-            files.append(fp)
-    return files
+            result.append(os.path.join(r, f))
+    return result
 
 
+# ── CLI ────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="Filter audit logs by datetime range")
     ap.add_argument("input", help="Input .tar.gz or folder")
@@ -263,13 +279,14 @@ def main():
             except ValueError:
                 pass
         try:
-            return datetime.strptime(val, "%a %b %d %H:%M:%S %z %Y").replace(tzinfo=None)
+            return datetime.strptime(val,
+                "%a %b %d %H:%M:%S %z %Y").replace(tzinfo=None)
         except ValueError:
             pass
         raise ValueError(f"Cannot parse date: {val}")
 
-    _start = pdate(args.start)
-    _end = pdate(args.end)
+    s_val = pdate(args.start)
+    e_val = pdate(args.end)
 
     inp = os.path.abspath(args.input)
     out = os.path.abspath(args.output)
@@ -281,113 +298,58 @@ def main():
 
     work = tempfile.mkdtemp()
     try:
-        # === Case 1: single non-tar file ===
+        # ── Case 1: single non-tar file ──
         if in_is_file and not in_is_tar:
             src = os.path.join(work, os.path.basename(inp))
             shutil.copy2(inp, src)
-            process_text(src, _start, _end)
+            process_text(src, s_val, e_val)
             if out_is_tar:
                 with tarfile.open(out, "w:gz") as tar:
                     tar.add(src, arcname=os.path.basename(src))
             else:
                 shutil.copy2(src, out)
 
-        # === Case 2: tar archive ===
-        # STREAMING: iterate tar members one-by-one, process each, discard.
-        # Nested tars recurse via handle_tar() which is also streaming.
+        # ── Case 2: tar archive (streaming) ──
         elif in_is_tar:
             comp = tar_comp(inp)
+            rm = ("r:" + comp) if comp else "r:"
             src_dir = os.path.join(work, "extracted")
-            os.makedirs(src_dir)
+            with tarfile.open(inp, rm) as tar:
+                stream_extract_process(tar, src_dir, s_val, e_val)
+            repack_tar(src_dir, os.path.join(work, "result.tar.gz"),
+                       comp, arcroot="")
+            shutil.copy2(
+                os.path.join(work, "result.tar.gz"), out)
 
-            collected = []
-
-            with tarfile.open(inp) as tar:
-                for member in tar:
-                    if member.isdir():
-                        os.makedirs(os.path.join(src_dir, member.name), exist_ok=True)
-                        continue
-
-                    try:
-                        if is_tar(member.name):
-                            # Nested tar: extract to temp, recurse, then extract
-                            # the repacked result into src_dir.
-                            nested_tmp = tempfile.mkdtemp(dir=src_dir)
-                            tar.extract(member, path=nested_tmp)
-                            entries = os.listdir(nested_tmp)
-                            if entries:
-                                nested_path = os.path.join(
-                                    nested_tmp,
-                                    _find_nested_file(entries, member.name)
-                                )
-                                # Recurse: handle_tar processes + repacks in place
-                                handle_tar(nested_path, _start, _end, workers)
-                                # Now nested_path is the PROCESSED tar.
-                                # Extract its contents into src_dir.
-                                extract_nested_to(nested_path, nested_tmp, src_dir)
-                            else:
-                                sys.stderr.write(f"WARNING {member.name}: empty nested tar\n")
-                            shutil.rmtree(nested_tmp, ignore_errors=True)
-                            continue
-
-                        # Single file: unique temp dir -> copy to src_dir -> collect
-                        uniq_tmp = tempfile.mkdtemp(dir=src_dir)
-                        tar.extract(member, path=uniq_tmp)
-                        entry = _resolve_file([(uniq_tmp, f) for f in os.listdir(uniq_tmp)])
-                        if entry and os.path.isfile(entry):
-                            target = os.path.join(
-                                src_dir,
-                                _safe_name(member.name)
-                            )
-                            os.chmod(entry, 0o644)
-                            shutil.copy2(entry, target)
-                            collected.append((target, _start, _end))
-                        shutil.rmtree(uniq_tmp, ignore_errors=True)
-
-                    except Exception as e:
-                        sys.stderr.write(f"WARNING {member.name}: {e}\n")
-
-            # Process collected files with bounded Pool
-            total = len(collected)
-            if total:
-                batches = [[item] for item in collected]
-                done = 0
-                with Pool(workers) as pool:
-                    for n in pool.imap_unordered(worker_batch, batches):
-                        done += n
-                        sys.stdout.write(f"\rProgress: {done}/{total}")
-                        sys.stdout.flush()
-                sys.stdout.write("\n")
-
-            if out_is_tar:
-                repack_dir(src_dir, out, comp)
-            else:
-                if os.path.exists(out):
-                    shutil.rmtree(out)
-                shutil.copytree(src_dir, out)
-
-        # === Case 3: folder input ===
+        # ── Case 3: folder (Pool + multi-core) ──
         elif os.path.isdir(inp):
             workdir = os.path.join(work, "input")
             shutil.copytree(inp, workdir)
-            files = _collect_writable(workdir)
-            total = len(files)
+            for r, _, fs in os.walk(workdir):
+                for f in fs:
+                    os.chmod(os.path.join(r, f), 0o644)
 
+            files = collect_files(workdir)
+            total = len(files)
             if total:
                 nw = min(workers, total)
                 batches = [[] for _ in range(nw)]
                 for i, f in enumerate(files):
-                    batches[i % nw].append((f, _start, _end))
+                    batches[i % nw].append((f,))
                 done = 0
                 with Pool(nw) as pool:
-                    for n in pool.imap_unordered(worker_batch, batches):
+                    for n in pool.imap_unordered(
+                        _process_batch,
+                        [(batch, s_val, e_val)
+                         for batch in batches]
+                    ):
                         done += n
                         sys.stdout.write(f"\rProgress: {done}/{total}")
                         sys.stdout.flush()
                 sys.stdout.write("\n")
 
             if out_is_tar:
-                repack_dir(workdir, out)
+                repack_tar(workdir, out, "gz", arcroot="")
             else:
                 if os.path.exists(out):
                     shutil.rmtree(out)
@@ -399,33 +361,6 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
     print(f"Done. Output: {out}")
-
-
-def _safe_name(path):
-    """Convert a path with slashes into a safe filename."""
-    return "_" + path.lstrip("/").replace("/", "_").replace(" ", "_")
-
-
-def extract_nested_to(nested_path, nested_tmp, src_dir):
-    """Extract a processed nested tar (now repacked) into src_dir."""
-    if not nested_path or not os.path.isfile(nested_path):
-        return
-    if not is_tar(nested_path):
-        return
-    extract_dir = tempfile.mkdtemp(dir=src_dir)
-    try:
-        with tarfile.open(nested_path) as tar:
-            tar.extractall(path=extract_dir)
-        # Move extracted files into src_dir with proper relative paths
-        for root, _, files in os.walk(extract_dir):
-            for f in files:
-                fp = os.path.join(root, f)
-                rel = os.path.relpath(fp, extract_dir)
-                target = os.path.join(src_dir, rel)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                shutil.copy2(fp, target)
-    finally:
-        shutil.rmtree(extract_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
