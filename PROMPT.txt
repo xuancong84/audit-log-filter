@@ -38,11 +38,15 @@ General guidelines:
 - Keep the code as short as possible.
 - Every text input file can have a mixture of timestamp line formats, do not assume a single format throughout the whole file.
 - Support multiple CPU cores, some tar archives can be huge, do not wait for full extraction, start processing whenever any file is available. Thus, you need to track global worker processes count.
-- Make your code generic and compatible with as many formats as possible. If it crashes on a line, ignore the line, leave it as it is.
+- Make your code generic and compatible with as many formats as possible. If it crashes on a line, ignore the line, leave it as it is in the output.
 - If the input file is empty or all its content lies outside the date range, output the empty file.
 - Print progress using '\r' to avoid massive scroll, output warnings/errors if any.
 - cmdline argument must support ISO8601 including bare date format: "2026-02-01" (assuming current timezone)
 
 
 2. Debugging
-Use `/opt/anaconda3/bin/python` to test your python code on `./input` for the given date range from 2026-02-01 to 2026-05-15, you can use `./output` for output folder. Examine every output file to make sure it is correct. Fix bugs if any.
+Use `/opt/anaconda3/bin/python` to test your python code on `./input` for the given date range from 2026-02-01 to 2026-05-15, use `./output` for output folder:
+```
+/opt/anaconda3/bin/python filter-audit.py input output --start 2026-02-01 --end 2026-05-15 -j 8
+```
+Examine every output file to make sure it is correct. Fix bugs if any.
